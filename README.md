@@ -31,7 +31,10 @@ python3 run_adversarial_attack_in_batch_<model_name>.py \
     --output_path <path_to_store_the_results> \
     --max_iter <num_of_iterations_for_attack> \
     --pl <programming_language_to_use> \
-    --batch_size <batch_size>
+    --batch_size <batch_size> \
+    --method <attack_method> \
+    --alpha <alpha_value> \
+    --top_k <top_k_value>
 ```
 
 **Argument Explanations:**
@@ -43,8 +46,33 @@ python3 run_adversarial_attack_in_batch_<model_name>.py \
 * `max_iter`: The maximum number of iterations for the attack algorithm.
 * `pl`: The programming language of the code snippets. Currently supported languages are `python`, `cpp`, `java`, `js`, and `go`.
 * `batch_size`: The number of query-code pairs to process in each batch.
+* `method`: The attack variant to use (default: `original`). See **Attack Methods** below.
+* `alpha`: Weight for the query-similarity bonus term (default: `0.05`). Used by alpha-based methods.
+* `top_k`: Number of top variables to replace (default: `20`). Used by top-k methods (CodeT5+ only).
 
 This command will run the adversarial attack on all combinations of (query, code) pairs from the specified input files. The results, including the adversarial code generated at each iteration, will be saved as a Python dictionary in a pickle file at the `output_path`. The dictionary keys in this file are tuples of `(query_id, code_id, iter_count)`.
+
+### Attack Methods
+
+The `--method` flag selects the attack variant. All methods are backward-compatible; omitting `--method` defaults to `original`.
+
+**CodeT5+ methods** (`run_adversarial_attack_in_batch_codet5p.py`):
+
+| Method | Description |
+|--------|-------------|
+| `original` | Baseline gradient-based attack on all identifiers |
+| `top_k` | Only replaces top-k variables (by gradient influence), skips function names |
+| `top_k_alpha` | Top-k variable selection with alpha term: `influence + alpha * max(cos_sim(replacement, query_tokens))` |
+| `alpha_func_influence_only` | Alpha for variables, original influence for function names, skips `_` tokens |
+| `alpha_preserve_identifier_style` | Alpha for both variables and function names, preserves `_` prefix style |
+| `alpha_only_no_grad` | Ablation: no gradient, uses only `alpha * max_query_similarity` |
+
+**OASIS methods** (`run_adversarial_attack_in_batch_oasis.py`):
+
+| Method | Description |
+|--------|-------------|
+| `original` | Baseline gradient-based attack on all identifiers |
+| `alpha_preserve_identifier_style` | Alpha term with identifier style preservation (if original token starts with `_`, replacement must too) |
 
 **Example Command:**
 
@@ -55,7 +83,10 @@ python3 run_adversarial_attack_in_batch_codet5p.py \
     --output_path ./attack_record_for_cosqa_based_on_codet5p.pickle \
     --max_iter 5 \
     --pl python \
-    --batch_size 20
+    --batch_size 20 \
+    --method alpha_preserve_identifier_style \
+    --alpha 0.05 \
+    --top_k 20
 ```
 
 ## Extending to Other Models
