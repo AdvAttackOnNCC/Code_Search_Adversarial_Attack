@@ -16,7 +16,11 @@ from sentence_transformers import SentenceTransformer
 
 
 # Append project-specific paths
-from attack_scripts.code_search_adv_attack_batch_oasis import adversarial_attack_batch
+from attack_scripts.code_search_adv_attack_batch_oasis import (
+    adversarial_attack_batch,
+    adversarial_attack_batch_alpha_preserve_identifier_style,
+    get_underscore_starting_tokens,
+)
 
 def get_current_pacific_time():
     pacific_time = datetime.now(ZoneInfo("America/Los_Angeles"))
@@ -54,6 +58,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_iter", type=int, default=5, help="Max number of iterations for adversarial attack")
     parser.add_argument("--max_length", type=int, default=512, help="Max length of the code")
     parser.add_argument("--pl", type=str, default="python", help="Programming language of the code")
+    parser.add_argument("--method", type=str, default="original",
+                        choices=["original", "alpha_preserve_identifier_style"],
+                        help="Attack method to use")
+    parser.add_argument("--alpha", type=float, default=0.05, help="Alpha weight for query similarity bonus")
     args = parser.parse_args()
 
     # Update wandb configuration with run parameters
@@ -64,7 +72,9 @@ if __name__ == "__main__":
         "batch_size": args.batch_size,
         "max_iter": args.max_iter,
         "max_length": args.max_length,
-        "pl": args.pl
+        "pl": args.pl,
+        "method": args.method,
+        "alpha": args.alpha,
     })
 
     # Start the GPU logging thread
@@ -95,25 +105,33 @@ if __name__ == "__main__":
     print(f"Loading model: {model_name}")
     model = SentenceTransformer(model_name, trust_remote_code=True).to(device)
 
+    # Pre-compute underscore token IDs if using the new method
+    underscore_token_ids = None
+    if args.method == "alpha_preserve_identifier_style":
+        print("Pre-computing underscore-starting tokens...")
+        underscore_token_ids = get_underscore_starting_tokens(model.tokenizer)
+        print(f"Found {len(underscore_token_ids)} tokens starting with '_'")
+
     full_attack_record = {}
     total_iterations = attack_iter * len(test_qids) * math.ceil(len(test_cids) / batch_size)
     pbar = tqdm(total=total_iterations)
-
-    
 
     for attack_count in range(attack_iter):
         for i in range(len(test_qids)):
             query_texts = [dataset['query'][test_qids[i]]]
             for j in range(0, len(test_cids), batch_size):
                 code_texts = [recorded_codes[(test_qids[i], cid)] for cid in test_cids[j: j+batch_size]]
-                attack_records = adversarial_attack_batch(
-                    query_texts,
-                    code_texts,
-                    model,
-                    device=device,
-                    max_length=args.max_length,
-                    pl=args.pl
-                )
+                if args.method == "original":
+                    attack_records = adversarial_attack_batch(
+                        query_texts, code_texts, model,
+                        device=device, max_length=args.max_length, pl=args.pl
+                    )
+                elif args.method == "alpha_preserve_identifier_style":
+                    attack_records = adversarial_attack_batch_alpha_preserve_identifier_style(
+                        query_texts, code_texts, model,
+                        device=device, max_length=args.max_length, pl=args.pl,
+                        alpha=args.alpha, underscore_token_ids=underscore_token_ids
+                    )
                 for keys in attack_records:
                     curr_qid = test_qids[i]
                     curr_cid = test_cids[j + keys[1]]

@@ -16,7 +16,14 @@ import threading
 # Append project-specific paths
 sys.path.append("../")
 from attack_scripts.codet5_toks import valid_tok_idx_begin_with_space, valid_tok_idx_no_space
-from attack_scripts.code_search_adv_attack_batch_codet5p import adversarial_attack_batch
+from attack_scripts.code_search_adv_attack_batch_codet5p import (
+    adversarial_attack_batch,
+    adversarial_attack_batch_top_k,
+    adversarial_attack_batch_top_k_alpha,
+    adversarial_attack_batch_alpha_func_influence_only,
+    adversarial_attack_batch_alpha_all_modified_preserve_identifier_style,
+    adversarial_attack_batch_alpha_only_no_grad,
+)
 
 def get_current_pacific_time():
     pacific_time = datetime.now(ZoneInfo("America/Los_Angeles"))
@@ -59,6 +66,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_iter", type=int, default=5, help="Max number of iterations for adversarial attack")
     parser.add_argument("--max_length", type=int, default=512, help="Max length of the code")
     parser.add_argument("--pl", type=str, default="python", help="Programming language of the code")
+    parser.add_argument("--method", type=str, default="original",
+                        choices=["original", "top_k", "top_k_alpha", "alpha_func_influence_only",
+                                 "alpha_preserve_identifier_style", "alpha_only_no_grad"],
+                        help="Attack method to use")
+    parser.add_argument("--alpha", type=float, default=0.05, help="Alpha weight for query similarity bonus")
+    parser.add_argument("--top_k", type=int, default=20, help="Number of top variables to replace")
     args = parser.parse_args()
 
     # Update wandb configuration with run parameters
@@ -69,7 +82,10 @@ if __name__ == "__main__":
         "batch_size": args.batch_size,
         "max_iter": args.max_iter,
         "max_length": args.max_length,
-        "pl": args.pl
+        "pl": args.pl,
+        "method": args.method,
+        "alpha": args.alpha,
+        "top_k": args.top_k,
     })
 
     # Start the GPU logging thread
@@ -103,15 +119,36 @@ if __name__ == "__main__":
             query_texts = [dataset['query'][test_qids[i]]]
             for j in range(0, len(test_cids), batch_size):
                 code_texts = [recorded_codes[(test_qids[i], cid)] for cid in test_cids[j: j+batch_size]]
-                attack_records = adversarial_attack_batch(
-                    query_texts,
-                    code_texts,
-                    model,
-                    tokenizer,
-                    device=device,
-                    max_length=args.max_length,
-                    pl=args.pl
-                )
+                if args.method == "original":
+                    attack_records = adversarial_attack_batch(
+                        query_texts, code_texts, model, tokenizer,
+                        device=device, max_length=args.max_length, pl=args.pl
+                    )
+                elif args.method == "top_k":
+                    attack_records = adversarial_attack_batch_top_k(
+                        query_texts, code_texts, model, tokenizer, args.top_k,
+                        device=device, max_length=args.max_length, pl=args.pl
+                    )
+                elif args.method == "top_k_alpha":
+                    attack_records = adversarial_attack_batch_top_k_alpha(
+                        query_texts, code_texts, model, tokenizer, args.top_k, args.alpha,
+                        device=device, max_length=args.max_length, pl=args.pl
+                    )
+                elif args.method == "alpha_func_influence_only":
+                    attack_records = adversarial_attack_batch_alpha_func_influence_only(
+                        query_texts, code_texts, model, tokenizer, args.top_k, args.alpha,
+                        device=device, max_length=args.max_length, pl=args.pl
+                    )
+                elif args.method == "alpha_preserve_identifier_style":
+                    attack_records = adversarial_attack_batch_alpha_all_modified_preserve_identifier_style(
+                        query_texts, code_texts, model, tokenizer, args.top_k, args.alpha,
+                        device=device, max_length=args.max_length, pl=args.pl
+                    )
+                elif args.method == "alpha_only_no_grad":
+                    attack_records = adversarial_attack_batch_alpha_only_no_grad(
+                        query_texts, code_texts, model, tokenizer, args.top_k, args.alpha,
+                        device=device, max_length=args.max_length, pl=args.pl
+                    )
                 for keys in attack_records:
                     curr_qid = test_qids[i]
                     curr_cid = test_cids[j + keys[1]]

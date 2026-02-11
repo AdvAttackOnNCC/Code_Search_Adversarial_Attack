@@ -9,7 +9,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from sentence_transformers import SentenceTransformer, util
 from sentence_transformers.util import cos_sim # Helper for cosine similarity
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import traceback
 import torch.nn.functional as F
 import string
@@ -777,3 +777,371 @@ def calculate_similarity_st( # Renamed function
     return similarity_matrix
 
 
+def get_underscore_starting_tokens(tokenizer, max_vocab_size: int = 200000) -> set:
+    """
+    Pre-compute set of token IDs that decode to strings starting with underscore.
+
+    Args:
+        tokenizer: The tokenizer
+        max_vocab_size: Maximum vocab size to check
+
+    Returns:
+        Set of token IDs whose decoded strings start with '_'
+    """
+    underscore_token_ids = set()
+    vocab_size = min(len(tokenizer), max_vocab_size)
+
+    for token_id in range(vocab_size):
+        try:
+            decoded = tokenizer.decode([token_id], skip_special_tokens=True)
+            if decoded and len(decoded) > 0 and decoded[0] == '_':
+                underscore_token_ids.add(token_id)
+        except:
+            pass
+
+    return underscore_token_ids
+
+
+def adversarial_attack_batch_alpha_preserve_identifier_style(
+    query_texts: List[str],
+    code_texts: List[str],
+    model: SentenceTransformer,
+    device: torch.device = torch.device('cuda:0'),
+    max_length: int = 512,
+    pl: str = 'python',
+    alpha: float = 0.05,
+    top_k: int = 20,
+    progress_callback=None,
+    underscore_token_ids: Optional[set] = None
+) -> Dict:
+    """
+    OASIS adversarial attack with alpha weighting and identifier style preservation.
+
+    If an original token starts with "_", its replacement must also start with "_".
+    This preserves naming conventions like __init__, _private, etc.
+
+    Uses modified influence: influence + alpha * max(cos_sim(replacement_token, query_tokens))
+
+    Args:
+        query_texts: List of query strings
+        code_texts: List of code strings
+        model: SentenceTransformer model
+        device: Device to run on
+        max_length: Max sequence length
+        pl: Programming language
+        alpha: Weight for the query similarity bonus term
+        top_k: Number of top variables to replace
+        progress_callback: Optional callback function
+        underscore_token_ids: Pre-computed set of token IDs starting with '_'.
+                             If None, will be computed on first call.
+
+    Returns:
+        Dictionary mapping (query_idx, code_idx) to replacement info
+    """
+    tokenizer = model.tokenizer
+
+    # Pre-compute tokens that start with underscore (only if not provided)
+    if underscore_token_ids is None:
+        print("Pre-computing underscore-starting tokens...")
+        underscore_token_ids = get_underscore_starting_tokens(tokenizer)
+        print(f"Found {len(underscore_token_ids)} tokens starting with '_'")
+
+    # Compute token influence
+    _, token_influence = token_replace_options_batch(
+        query_texts, code_texts, model, device, max_length
+    )
+
+    tokenized_codes = tokenizer(
+        code_texts,
+        return_offsets_mapping=True,
+        padding='max_length',
+        truncation=True,
+        max_length=max_length
+    )
+
+    tokenized_queries = tokenizer(
+        query_texts,
+        return_tensors='pt',
+        padding='max_length',
+        truncation=True,
+        max_length=max_length
+    )
+
+    replaceable_tokens = find_replaceable_tokens(code_texts, tokenized_codes, max_length, pl)
+
+    # Get all token embeddings
+    transformer_model = model[0].auto_model
+    embedding_layer = transformer_model.get_input_embeddings()
+    all_token_embeddings = embedding_layer.weight.data.cpu()
+
+    # Precompute query token embeddings
+    query_token_embeddings_list = []
+    for q_idx in range(len(query_texts)):
+        query_token_ids = tokenized_queries['input_ids'][q_idx]
+        attention_mask = tokenized_queries['attention_mask'][q_idx]
+        valid_query_token_ids = query_token_ids[attention_mask == 1]
+        query_embs = all_token_embeddings[valid_query_token_ids]
+        query_token_embeddings_list.append(query_embs)
+
+    # Precompute max similarity
+    max_query_sim_list = []
+    for q_idx, query_embs in enumerate(query_token_embeddings_list):
+        sim_matrix = cos_sim(all_token_embeddings, query_embs)
+        max_sim = sim_matrix.max(dim=1).values
+        max_query_sim_list.append(max_sim)
+
+    result = {}
+
+    for c_idx in range(len(code_texts)):
+        curr_replaceable_tokens = replaceable_tokens[c_idx]
+        curr_code_tokens = tokenized_codes['input_ids'][c_idx]
+
+        # Collect variable tokens (with special character handling like original OASIS)
+        var_token_pairs = {'begin_toks': [], 'no_space_toks': [], 'special_character_case': []}
+        for var_name in curr_replaceable_tokens['variables']:
+            var_tok_len = set()
+            for i in curr_replaceable_tokens['variables'][var_name]:
+                var_tok_len.add(len(i))
+            if len(var_tok_len) != 1:
+                continue
+
+            var_tok_len = var_tok_len.pop()
+            for i in range(var_tok_len):
+                curr_occurrence = []
+                for sub_list in curr_replaceable_tokens['variables'][var_name]:
+                    curr_occurrence.append(sub_list[i])
+                curr_occurrence = tuple(curr_occurrence)
+
+                if i == 0:
+                    skip_flag = False
+                    curr_token_texts = [curr_code_tokens[curr_occurrence[q]] for q in range(len(curr_occurrence))]
+                    curr_token_strs = [tokenizer.decode(curr_token_text, skip_special_tokens=True) for curr_token_text in curr_token_texts]
+
+                    begin_with_special_tok = {}
+                    begin_with_space_count = 0
+                    for curr_token_idx, curr_token_str in enumerate(curr_token_strs):
+                        if len(curr_token_str) == 0:
+                            skip_flag = True
+                            break
+                        if " " == curr_token_str[0]:
+                            begin_with_space_count += 1
+                        elif curr_token_str[0] in valid_special_cases.keys():
+                            if curr_token_str[0] not in begin_with_special_tok:
+                                begin_with_special_tok[curr_token_str[0]] = []
+                            begin_with_special_tok[curr_token_str[0]].append(curr_occurrence[curr_token_idx])
+                        else:
+                            skip_flag = True
+                            break
+
+                    if skip_flag:
+                        break
+
+                    if len(begin_with_special_tok) >= 1:
+                        others = []
+                        for curr_token_idx in range(len(curr_token_strs)):
+                            if curr_occurrence[curr_token_idx] not in sum(begin_with_special_tok.values(), []):
+                                others.append(curr_occurrence[curr_token_idx])
+                        var_token_pairs['special_character_case'].append({
+                            'special_chars': begin_with_special_tok,
+                            'others': others
+                        })
+                    elif begin_with_space_count != 0:
+                        var_token_pairs['begin_toks'].append(curr_occurrence)
+                    else:
+                        var_token_pairs['no_space_toks'].append(curr_occurrence)
+                else:
+                    var_token_pairs['no_space_toks'].append(curr_occurrence)
+
+        # Collect function name tokens
+        func_token_pairs = {'begin_toks': [], 'no_space_toks': []}
+        for func_name in curr_replaceable_tokens['func_names']:
+            func_tok_len = set()
+            for i in curr_replaceable_tokens['func_names'][func_name]:
+                func_tok_len.add(len(i))
+            if len(func_tok_len) != 1:
+                continue
+
+            func_tok_len = func_tok_len.pop()
+            for i in range(func_tok_len):
+                curr_occurrence = []
+                for sub_list in curr_replaceable_tokens['func_names'][func_name]:
+                    curr_occurrence.append(sub_list[i])
+                curr_occurrence = tuple(curr_occurrence)
+
+                if i == 0:
+                    func_token_pairs['begin_toks'].append(curr_occurrence)
+                else:
+                    func_token_pairs['no_space_toks'].append(curr_occurrence)
+
+        for q_idx in range(len(query_texts)):
+            curr_influence = token_influence[q_idx][c_idx]
+            max_query_sim = max_query_sim_list[q_idx]
+
+            # Modified influence: influence + alpha * max_query_similarity
+            modified_influence = curr_influence + alpha * max_query_sim.unsqueeze(0)
+
+            # Process variables
+            variable_influences = []
+            for positions_to_consider in var_token_pairs['begin_toks']:
+                cum_influence = modified_influence[positions_to_consider, :].sum(dim=0)
+                mask = torch.zeros(cum_influence.size(), dtype=torch.bool)
+                mask[torch.tensor(valid_tok_idx_begin_with_space, dtype=torch.long)] = True
+                cum_influence_masked = cum_influence.clone()
+                cum_influence_masked[~mask] = float('-inf')
+                best_tok = cum_influence_masked.argmax().item()
+                best_influence = cum_influence_masked[best_tok].item()
+                if best_influence > 0:
+                    variable_influences.append((positions_to_consider, best_tok, best_influence, True))
+
+            for positions_to_consider in var_token_pairs['no_space_toks']:
+                cum_influence = modified_influence[positions_to_consider, :].sum(dim=0)
+                mask = torch.zeros(cum_influence.size(), dtype=torch.bool)
+                mask[torch.tensor(valid_tok_idx_no_space, dtype=torch.long)] = True
+                cum_influence_masked = cum_influence.clone()
+                cum_influence_masked[~mask] = float('-inf')
+                best_tok = cum_influence_masked.argmax().item()
+                best_influence = cum_influence_masked[best_tok].item()
+                if best_influence > 0:
+                    variable_influences.append((positions_to_consider, best_tok, best_influence, False))
+
+            # Sort and take top_k variables
+            variable_influences.sort(key=lambda x: x[2], reverse=True)
+            top_k_variables = variable_influences[:top_k]
+
+            # Build replace_dict for top_k variables
+            replace_dict = {}
+            for positions_to_consider, _, _, is_begin_tok in top_k_variables:
+                # Check if original token starts with underscore
+                original_token_id = curr_code_tokens[positions_to_consider[0]]
+                original_starts_with_underscore = original_token_id in underscore_token_ids
+
+                cum_influence = modified_influence[positions_to_consider, :].sum(dim=0)
+                valid_tokens = valid_tok_idx_begin_with_space if is_begin_tok else valid_tok_idx_no_space
+                base_mask = torch.zeros(cum_influence.size(), dtype=torch.bool)
+                base_mask[torch.tensor(valid_tokens, dtype=torch.long)] = True
+
+                # Additional constraint: if original starts with _, only allow _ replacements
+                if original_starts_with_underscore:
+                    underscore_mask = torch.zeros(cum_influence.size(), dtype=torch.bool)
+                    underscore_mask[list(underscore_token_ids)] = True
+                    mask = base_mask & underscore_mask
+                else:
+                    mask = base_mask
+
+                cum_influence_masked = cum_influence.clone()
+                cum_influence_masked[~mask] = -1
+                positive_mask = cum_influence_masked > 0
+                positive_indices = torch.nonzero(positive_mask, as_tuple=True)[0]
+
+                if positive_indices.numel() > 0:
+                    sorted_order = torch.argsort(cum_influence_masked[positive_indices], descending=True)
+                    sorted_indices = positive_indices[sorted_order][:20]
+                    best_tok_idx = {int(idx.item()): float(cum_influence_masked[idx].item()) for idx in sorted_indices}
+                    if best_tok_idx:
+                        replace_dict[positions_to_consider] = best_tok_idx
+
+            # Process function names similarly
+            for positions_to_consider in func_token_pairs['begin_toks']:
+                original_token_id = curr_code_tokens[positions_to_consider[0]]
+                original_starts_with_underscore = original_token_id in underscore_token_ids
+
+                cum_influence = modified_influence[positions_to_consider, :].sum(dim=0)
+                base_mask = torch.zeros(cum_influence.size(), dtype=torch.bool)
+                base_mask[torch.tensor(valid_tok_idx_begin_with_space, dtype=torch.long)] = True
+
+                if original_starts_with_underscore:
+                    underscore_mask = torch.zeros(cum_influence.size(), dtype=torch.bool)
+                    underscore_mask[list(underscore_token_ids)] = True
+                    mask = base_mask & underscore_mask
+                else:
+                    mask = base_mask
+
+                cum_influence_masked = cum_influence.clone()
+                cum_influence_masked[~mask] = -1
+                positive_mask = cum_influence_masked > 0
+                positive_indices = torch.nonzero(positive_mask, as_tuple=True)[0]
+
+                if positive_indices.numel() > 0:
+                    sorted_order = torch.argsort(cum_influence_masked[positive_indices], descending=True)
+                    sorted_indices = positive_indices[sorted_order][:20]
+                    best_tok_idx = {int(idx.item()): float(cum_influence_masked[idx].item()) for idx in sorted_indices}
+                    if best_tok_idx:
+                        replace_dict[positions_to_consider] = best_tok_idx
+
+            for positions_to_consider in func_token_pairs['no_space_toks']:
+                original_token_id = curr_code_tokens[positions_to_consider[0]]
+                original_starts_with_underscore = original_token_id in underscore_token_ids
+
+                cum_influence = modified_influence[positions_to_consider, :].sum(dim=0)
+                base_mask = torch.zeros(cum_influence.size(), dtype=torch.bool)
+                base_mask[torch.tensor(valid_tok_idx_no_space, dtype=torch.long)] = True
+
+                if original_starts_with_underscore:
+                    underscore_mask = torch.zeros(cum_influence.size(), dtype=torch.bool)
+                    underscore_mask[list(underscore_token_ids)] = True
+                    mask = base_mask & underscore_mask
+                else:
+                    mask = base_mask
+
+                cum_influence_masked = cum_influence.clone()
+                cum_influence_masked[~mask] = -1
+                positive_mask = cum_influence_masked > 0
+                positive_indices = torch.nonzero(positive_mask, as_tuple=True)[0]
+
+                if positive_indices.numel() > 0:
+                    sorted_order = torch.argsort(cum_influence_masked[positive_indices], descending=True)
+                    sorted_indices = positive_indices[sorted_order][:20]
+                    best_tok_idx = {int(idx.item()): float(cum_influence_masked[idx].item()) for idx in sorted_indices}
+                    if best_tok_idx:
+                        replace_dict[positions_to_consider] = best_tok_idx
+
+            # Handle special character cases (e.g., '(' before parameter names)
+            for positions_to_consider in var_token_pairs['special_character_case']:
+                special_char_positions = positions_to_consider['special_chars']
+                normal_position = positions_to_consider['others']
+
+                left_param_replace = find_replacements_with_influence_special_case(
+                    modified_influence, valid_special_cases, special_char_positions, normal_position, return_size=1
+                )
+
+                if len(left_param_replace) > 0:
+                    for k, v in left_param_replace.items():
+                        if k in replace_dict:
+                            continue
+                        replace_dict[k] = v
+
+            # Apply Hungarian algorithm
+            if len(replace_dict) > 0:
+                best_match, _ = best_match_hungarian(replace_dict)
+            else:
+                best_match = {}
+
+            # Create token replacement dict
+            tok_replace_dict = {}
+            for tup in best_match:
+                for tok_id in tup:
+                    tok_replace_dict[tok_id] = best_match[tup]
+
+            # Apply replacements
+            code_toks_after_replacement = []
+            for tok_idx, tok in enumerate(curr_code_tokens):
+                if tok_idx in tok_replace_dict:
+                    code_toks_after_replacement.append(tok_replace_dict[tok_idx])
+                else:
+                    code_toks_after_replacement.append(tok)
+
+            code_text_after_replacement = tokenizer.decode(
+                code_toks_after_replacement,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False
+            )
+
+            result[(q_idx, c_idx)] = {
+                'replace_dict': tok_replace_dict,
+                'new_code': code_text_after_replacement
+            }
+
+            if progress_callback is not None:
+                progress_callback(q_idx, c_idx)
+
+    return result
